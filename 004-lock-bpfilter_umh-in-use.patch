@@ -1,0 +1,161 @@
+diff --git a/include/linux/bpfilter.h b/include/linux/bpfilter.h
+index 8ebcbdd70..d815622cd 100644
+--- a/include/linux/bpfilter.h
++++ b/include/linux/bpfilter.h
+@@ -12,6 +12,8 @@ int bpfilter_ip_get_sockopt(struct sock *sk, int optname, char __user *optval,
+ 			    int __user *optlen);
+ struct bpfilter_umh_ops {
+ 	struct umh_info info;
++	/* since ip_getsockopt() can run in parallel, serialize access to umh */
++	struct mutex lock;
+ 	int (*sockopt)(struct sock *sk, int optname,
+ 		       char __user *optval,
+ 		       unsigned int optlen, bool is_set);
+diff --git a/net/bpfilter/bpfilter_kern.c b/net/bpfilter/bpfilter_kern.c
+index c0fcde910..7ee4fea93 100644
+--- a/net/bpfilter/bpfilter_kern.c
++++ b/net/bpfilter/bpfilter_kern.c
+@@ -13,9 +13,6 @@
+ extern char bpfilter_umh_start;
+ extern char bpfilter_umh_end;
+ 
+-/* since ip_getsockopt() can run in parallel, serialize access to umh */
+-static DEFINE_MUTEX(bpfilter_lock);
+-
+ static void shutdown_umh(void)
+ {
+ 	struct task_struct *tsk;
+@@ -36,13 +33,6 @@ static void __stop_umh(void)
+ 		shutdown_umh();
+ }
+ 
+-static void stop_umh(void)
+-{
+-	mutex_lock(&bpfilter_lock);
+-	__stop_umh();
+-	mutex_unlock(&bpfilter_lock);
+-}
+-
+ static int __bpfilter_process_sockopt(struct sock *sk, int optname,
+ 				      char __user *optval,
+ 				      unsigned int optlen, bool is_set)
+@@ -58,7 +48,6 @@ static int __bpfilter_process_sockopt(struct sock *sk, int optname,
+ 	req.cmd = optname;
+ 	req.addr = (long __force __user)optval;
+ 	req.len = optlen;
+-	mutex_lock(&bpfilter_lock);
+ 	if (!bpfilter_ops.info.pid)
+ 		goto out;
+ 	n = __kernel_write(bpfilter_ops.info.pipe_to_umh, &req, sizeof(req),
+@@ -80,7 +69,6 @@ static int __bpfilter_process_sockopt(struct sock *sk, int optname,
+ 	}
+ 	ret = reply.status;
+ out:
+-	mutex_unlock(&bpfilter_lock);
+ 	return ret;
+ }
+ 
+@@ -99,7 +87,7 @@ static int start_umh(void)
+ 
+ 	/* health check that usermode process started correctly */
+ 	if (__bpfilter_process_sockopt(NULL, 0, NULL, 0, 0) != 0) {
+-		stop_umh();
++		shutdown_umh();
+ 		return -EFAULT;
+ 	}
+ 
+@@ -110,24 +98,30 @@ static int __init load_umh(void)
+ {
+ 	int err;
+ 
+-	if (!bpfilter_ops.stop)
+-		return -EFAULT;
++	mutex_lock(&bpfilter_ops.lock);
++	if (!bpfilter_ops.stop) {
++		err = -EFAULT;
++		goto out;
++	}
+ 	err = start_umh();
+ 	if (!err && IS_ENABLED(CONFIG_INET)) {
+ 		bpfilter_ops.sockopt = &__bpfilter_process_sockopt;
+ 		bpfilter_ops.start = &start_umh;
+ 	}
+-
++out:
++	mutex_unlock(&bpfilter_ops.lock);
+ 	return err;
+ }
+ 
+ static void __exit fini_umh(void)
+ {
++	mutex_lock(&bpfilter_ops.lock);
+ 	if (IS_ENABLED(CONFIG_INET)) {
++		shutdown_umh();
+ 		bpfilter_ops.start = NULL;
+ 		bpfilter_ops.sockopt = NULL;
+ 	}
+-	stop_umh();
++	mutex_unlock(&bpfilter_ops.lock);
+ }
+ module_init(load_umh);
+ module_exit(fini_umh);
+diff --git a/net/ipv4/bpfilter/sockopt.c b/net/ipv4/bpfilter/sockopt.c
+index de84ede4e..1e976bb93 100644
+--- a/net/ipv4/bpfilter/sockopt.c
++++ b/net/ipv4/bpfilter/sockopt.c
+@@ -14,10 +14,12 @@ EXPORT_SYMBOL_GPL(bpfilter_ops);
+ 
+ static void bpfilter_umh_cleanup(struct umh_info *info)
+ {
++	mutex_lock(&bpfilter_ops.lock);
+ 	bpfilter_ops.stop = true;
+ 	fput(info->pipe_to_umh);
+ 	fput(info->pipe_from_umh);
+ 	info->pid = 0;
++	mutex_unlock(&bpfilter_ops.lock);
+ }
+ 
+ static int bpfilter_mbox_request(struct sock *sk, int optname,
+@@ -25,21 +27,28 @@ static int bpfilter_mbox_request(struct sock *sk, int optname,
+ 				 unsigned int optlen, bool is_set)
+ {
+ 	int err;
+-
++	mutex_lock(&bpfilter_ops.lock);
+ 	if (!bpfilter_ops.sockopt) {
++		mutex_unlock(&bpfilter_ops.lock);
+ 		err = request_module("bpfilter");
++		mutex_lock(&bpfilter_ops.lock);
+ 
+ 		if (err)
+-			return err;
+-		if (!bpfilter_ops.sockopt)
+-			return -ECHILD;
++			goto out;
++		if (!bpfilter_ops.sockopt) {
++			err = -ECHILD;
++			goto out;
++		}
+ 	}
+ 	if (bpfilter_ops.stop) {
+ 		err = bpfilter_ops.start();
+ 		if (err)
+-			return err;
++			goto out;
+ 	}
+-	return bpfilter_ops.sockopt(sk, optname, optval, optlen, is_set);
++	err = bpfilter_ops.sockopt(sk, optname, optval, optlen, is_set);
++out:
++	mutex_unlock(&bpfilter_ops.lock);
++	return err;
+ }
+ 
+ int bpfilter_ip_set_sockopt(struct sock *sk, int optname, char __user *optval,
+@@ -61,6 +70,7 @@ int bpfilter_ip_get_sockopt(struct sock *sk, int optname, char __user *optval,
+ 
+ static int __init bpfilter_sockopt_init(void)
+ {
++	mutex_init(&bpfilter_ops.lock);
+ 	bpfilter_ops.stop = true;
+ 	bpfilter_ops.info.cleanup = &bpfilter_umh_cleanup;
+ 
